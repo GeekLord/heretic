@@ -3,6 +3,7 @@
 
 from collections.abc import Callable
 from contextlib import suppress
+from datetime import datetime, timezone
 from typing import Any, TypeAlias, cast
 
 import torch
@@ -41,6 +42,13 @@ def get_model_class(
         return AutoModelForImageTextToText
     else:
         return AutoModelForCausalLM
+
+
+# Some chat templates (e.g. gpt-oss) insert the current date into the prompt,
+# which makes the residuals, and therefore the modified model, depend on the day
+# Heretic is run. Rendering templates with a fixed date keeps results reproducible.
+def strftime_fixed_date(format: str) -> str:
+    return datetime(2026, 1, 1, tzinfo=timezone.utc).strftime(format)
 
 
 # The list contains one element per layer.
@@ -221,6 +229,15 @@ class Model:
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
 
+        # PEFT initializes A randomly from the global RNG. B is zero, so this doesn't
+        # change the model, but zeroing A too keeps saved adapters reproducible.
+        self._zero_lora_weights()
+
+    def _zero_lora_weights(self):
+        for name, module in self.model.named_modules():
+            if ("lora_A" in name or "lora_B" in name) and hasattr(module, "weight"):
+                torch.nn.init.zeros_(module.weight)
+
     def _get_quantization_config(self, dtype: str) -> BitsAndBytesConfig | None:
         """
         Creates quantization config based on settings.
@@ -315,9 +332,9 @@ class Model:
 
         if current_model == self.settings.model and not self.needs_reload:
             # Reset LoRA adapters to zero (identity transformation).
-            for name, module in self.model.named_modules():
-                if "lora_B" in name and hasattr(module, "weight"):
-                    torch.nn.init.zeros_(module.weight)
+            # Zeroing A as well ensures that adapter weights of modules not modified
+            # by the next trial don't depend on what previous trials did.
+            self._zero_lora_weights()
             return True
 
         # Purge existing model object from memory to make space.
@@ -464,6 +481,8 @@ class Model:
                 chats,
                 add_generation_prompt=True,
                 tokenize=False,
+                # Overrides the function that templates call to get the current date.
+                strftime_now=strftime_fixed_date,
             ),
         )
 
